@@ -108,38 +108,125 @@ static void *coalesce(void *bp);
 // 在分离空闲链表中寻找空闲块
 static void *find_fit(size_t asize);
 // 在空闲块中放置已分配块
-static void place(void *pb, size_t asize);
+static void place(void *bp, size_t asize);
 
 /*
  * mm_init - initialize the malloc package.
+ *
+ * mm_init - 初始化内存分配器
+ *
+ * 步骤：
+ *   在堆上为 LIST_MAX 个 void* 申请空间，作为“分离空闲链表头指针数组”；
+ *   构造序言块和结尾块；
+ *   调用 extend_heap 扩展一块初始空闲块。
  */
 int mm_init(void)
 {
+    // 在堆上申请 LIST_MAX 个 void* 的空间,存放各链表的头指针
+    size_t bytes = LIST_MAX * PTRSIZE;
+    bytes = ALIGN(bytes); // 保证数组本身按8字节对齐
+
+    void *p = mem_sbrk(bytes);
+
+    if (p == (void *)-1)
+    {
+        return -1; // 申请失败
+    }
+
+    seg_list_base = (void **)p;
+
+    // 初始化所有链表头为 NULL
+    for (int i = 0; i < LIST_MAX; i++)
+    {
+        seg_list_base[i] = NULL;
+    }
+
+    // 再申请 4 个 word，用于：对齐填充字 + 序言头 + 序言脚 + 结尾头
+    if ((heap_listp = mem_sbrk(4 * WSIZE)) == (void *)-1)
+    {
+        return -1;
+    }
+
+    // 内存布局：[填充字][序言头][序言脚][结尾头]
+    PUT(heap_listp + 0, 0);                      // 对齐填充字
+    PUT(heap_listp + 1 * WSIZE, PACK(DSIZE, 1)); // 序言头：大小为 DSIZE，已分配
+    PUT(heap_listp + 2 * WSIZE, PACK(DSIZE, 1)); // 序言脚：同上
+    PUT(heap_listp + 3 * WSIZE, PACK(0, 1));     // 结尾块头：大小为 0，已分配
+
+    // heap_listp 指向序言块 payload
+    heap_listp += 2 * WSIZE;
+
+    // 3. 扩展一块初始空闲块，大小为 CHUNKSIZE 字节
+    if (extend_heap(CHUNKSIZE / WSIZE) == NULL)
+    {
+        return -1;
+    }
+
     return 0;
 }
 
 /*
  * mm_malloc - Allocate a block by incrementing the brk pointer.
- *     Always allocate a block whose size is a multiple of the alignment.
+ * Always allocate a block whose size is a multiple of the alignment.
+ *
+ * mm_malloc - 分配 size 字节的内存块
+ *
+ * 返回：
+ *   成功：指向新块 payload 的指针
+ *   失败：NULL
  */
 void *mm_malloc(size_t size)
 {
-    int newsize = ALIGN(size + SIZE_T_SIZE);
-    void *p = mem_sbrk(newsize);
-    if (p == (void *)-1)
-        return NULL;
-    else
+    if (size == 0)
     {
-        *(size_t *)p = size;
-        return (void *)((char *)p + SIZE_T_SIZE);
+        // 忽略 size 为0的无效请求
+        return NULL;
     }
+
+    // 计算包含头、脚并对其后的实际块大小
+    size_t asize = adjust_block_size(size);
+
+    // 在分离空闲链表中寻找合适的空闲块
+    void *bp = find_fit(asize);
+    if (bp != NULL)
+    {
+        place(bp, asize);
+        return bp;
+    }
+
+    // 若找不到合适的空闲块,则需要扩展堆
+    size_t extend_size = (asize > CHUNKSIZE) ? asize : CHUNKSIZE;
+    bp = extend_heap(extend_size / WSIZE);
+    if (bp == NULL)
+    {
+        return NULL; // 扩展失败
+    }
+
+    // 在新扩展的空闲块中放置 asize 大小的已分配块
+    place(bp, asize);
+    return bp;
 }
 
 /*
  * mm_free - Freeing a block does nothing.
+ * 释放之前通过 mm_malloc / mm_realloc 分配的块
  */
 void mm_free(void *ptr)
 {
+    if (ptr == NULL)
+    {
+        // 释放空指针则什么都不做
+        return;
+    }
+
+    size_t size = GET_SIZE(HDRP(ptr));
+
+    // 将块头和块脚的 alloc 标志清零,标记为空闲
+    PUT(HDRP(ptr), PACK(size, 0));
+    PUT(FTRP(ptr), PACK(size, 0));
+
+    // 立即尝试与前后空闲块合并
+    coalesce(ptr);
 }
 
 /*
