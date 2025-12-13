@@ -496,6 +496,11 @@ static void *extend_heap(size_t words)
         size = (words + 1) * WSIZE;
     }
 
+    if (size < MIN_BLOCK_SIZE)
+    {
+        size = MIN_BLOCK_SIZE;
+    }
+
     bp = mem_sbrk(size);
     if (bp == (void *)-1)
     {
