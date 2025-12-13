@@ -231,22 +231,163 @@ void mm_free(void *ptr)
 
 /*
  * mm_realloc - Implemented simply in terms of mm_malloc and mm_free
+ *
+ * 缩小: 原地缩小,若剩余空间足够,拆分出新的空闲块并合并
+ * 扩容: 优先尝试与后继空闲块合并实现原地扩容
+ * 堆尾扩容:若后继为结尾块,先extend_heap,再尝试原地扩容
+ * 最后再尝试 malloc + memcpy + free
  */
 void *mm_realloc(void *ptr, size_t size)
 {
-    void *oldptr = ptr;
-    void *newptr;
-    size_t copySize;
+    // ptr 为NULL,相当于malloc
+    if (ptr == NULL)
+    {
+        return mm_malloc(size);
+    }
 
-    newptr = mm_malloc(size);
-    if (newptr == NULL)
+    // size 为0,相当于free
+    if (size == 0)
+    {
+        mm_free(ptr);
         return NULL;
-    copySize = *(size_t *)((char *)oldptr - SIZE_T_SIZE);
-    if (size < copySize)
-        copySize = size;
-    memcpy(newptr, oldptr, copySize);
-    mm_free(oldptr);
-    return newptr;
+    }
+
+    // 旧块总大小(包含header/footer)
+    size_t old_size = GET_SIZE(HDRP(ptr));
+
+    // 新需求块总大小(对齐 + 头脚 + 最小块约束)
+    size_t asize = adjust_block_size(size);
+
+    // 原地缩小
+    if (asize <= old_size)
+    {
+        size_t remain = old_size - asize;
+
+        // 剩余空间够形成合法空闲块则拆分,否则不拆
+        if (remain >= MIN_BLOCK_SIZE)
+        {
+            // 当前块缩成asize
+            PUT(HDRP(ptr), PACK(asize, 1));
+            PUT(FTRP(ptr), PACK(asize, 1));
+
+            // 构造紧随其后的空闲块
+            void *new_free = NEXT_BLKP(ptr);
+            PUT(HDRP(new_free), PACK(remain, 0));
+            PUT(FTRP(new_free), PACK(remain, 0));
+
+            // 新空闲块可能与后继空闲块相邻,交给 coalesce 合并
+            coalesce(new_free);
+        }
+
+        return ptr;
+    }
+
+    // 原地扩容,优先尝试与后继空闲块合并
+    void *next = NEXT_BLKP(ptr);
+
+    if (!GET_ALLOC(HDRP(next)))
+    {
+        size_t next_size = GET_SIZE(HDRP(next));
+        size_t combined = old_size + next_size;
+
+        if (combined >= asize)
+        {
+            // 将后继空闲块从分离链表中摘除
+            remove_free_block(next);
+
+            size_t remain = combined - asize;
+
+            if (remain >= MIN_BLOCK_SIZE)
+            {
+                // 合并后可拆分出新的空闲块
+                PUT(HDRP(ptr), PACK(asize, 1));
+                PUT(FTRP(ptr), PACK(asize, 1));
+
+                void *split = NEXT_BLKP(ptr);
+                PUT(HDRP(split), PACK(remain, 0));
+                PUT(FTRP(split), PACK(remain, 0));
+
+                // 将其与可能的后继空闲块合并
+                coalesce(split);
+            }
+            else
+            {
+                // 剩余空间太小,整块并入当前块
+                PUT(HDRP(ptr), PACK(combined, 1));
+                PUT(FTRP(ptr), PACK(combined, 1));
+            }
+            return ptr;
+        }
+    }
+
+    // 堆尾扩容,若后继为结尾块,先extend_heap,再尝试原地扩容
+    if (GET_SIZE(HDRP(next)) == 0 && GET_ALLOC(HDRP(next)) == 1)
+    {
+        // 需要补的字节数
+        size_t need = asize - old_size;
+
+        // 转为 words(向上取整),确保大于0
+        size_t words = (need + (WSIZE - 1)) / WSIZE;
+        if (words == 0)
+        {
+            words = 1;
+        }
+
+        // 扩展堆: 生成的新空闲块会插入空闲链表
+        if (extend_heap(words) != NULL)
+        {
+            // 扩展后,ptr后继为新空闲块
+            next = NEXT_BLKP(ptr);
+
+            if (!GET_ALLOC(HDRP(next)))
+            {
+                size_t next_size = GET_SIZE(HDRP(next));
+                size_t combined = old_size + next_size;
+
+                if (combined >= asize)
+                {
+                    remove_free_block(next);
+
+                    size_t remain = combined - asize;
+
+                    if (remain >= MIN_BLOCK_SIZE)
+                    {
+                        // 合并后可拆分出新的空闲块
+                        PUT(HDRP(ptr), PACK(asize, 1));
+                        PUT(FTRP(ptr), PACK(asize, 1));
+
+                        void *split = NEXT_BLKP(ptr);
+                        PUT(HDRP(split), PACK(remain, 0));
+                        PUT(FTRP(split), PACK(remain, 0));
+                        coalesce(split);
+                    }
+                    else
+                    {
+                        // 剩余空间太小,整块并入当前块
+                        PUT(HDRP(ptr), PACK(combined, 1));
+                        PUT(FTRP(ptr), PACK(combined, 1));
+                    }
+
+                    return ptr;
+                }
+            }
+        }
+    }
+
+    // 最后再尝试 malloc + memcpy + free
+    void *new_ptr = mm_malloc(size);
+    if (new_ptr == NULL)
+    {
+        return NULL;
+    }
+
+    size_t old_payload = old_size - 2 * WSIZE;
+    size_t copy_size = (size < old_payload) ? size : old_payload;
+
+    memcpy(new_ptr, ptr, copy_size);
+    mm_free(ptr);
+
+    return new_ptr;
 }
 
 // 将空闲块 bp 插入对应 size class 的空闲链表表头
