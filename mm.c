@@ -50,28 +50,41 @@ team_t team = {
 #define LIST_MAX 32                                     // 分离空闲链表的条数
 #define FIRST_FIT_MAX_IDX 22                            // 采用首次适配策略的链表最大下标
 #define BEST_FIT_SCAN_LIMIT 128                         // 最佳适配策略的扫描块数上限
+#define PREV_ALLOC 0x2                                  // 前块分配标志位
 
-// 将块大小 size 和分配标志 alloc 打包到一个字中
-#define PACK(size, alloc) ((size) | (alloc))
+// 改写某个块头的 prev_alloc 位
+#define SET_PREV_ALLOC_HDR(hdrp) PUT((hdrp), GET(hdrp) | PREV_ALLOC)
+#define CLR_PREV_ALLOC_HDR(hdrp) PUT((hdrp), GET(hdrp) & ~PREV_ALLOC)
+
+// 更新后继块的 prev_alloc位
+#define SET_NEXT_PREV_ALLOC(bp) SET_PREV_ALLOC_HDR(HDRP(NEXT_BLKP(bp)))
+#define CLR_NEXT_PREV_ALLOC(bp) CLR_PREV_ALLOC_HDR(HDRP(NEXT_BLKP(bp)))
+
 // 从地址p处读出一个字(size_t)
 #define GET(p) (*(size_t *)(p))
 // 向地址p处写入一个字(size_t)
 #define PUT(p, val) (*(size_t *)(p) = val)
-
 // 从地址 p 处取出块大小(屏蔽低3位标志位)
 #define GET_SIZE(p) (GET(p) & ~(size_t)0x7)
 // 从地址 p 处取出分配标志(最低位)
 #define GET_ALLOC(p) (GET(p) & 0x1)
+// 获取前块分配标志位
+#define GET_PREV_ALLOC(p) (GET(p) & PREV_ALLOC)
 
 //  由块指针 bp(指向payload) 得到该块头部指针
 #define HDRP(bp) ((char *)(bp) - WSIZE)
-// 由块指针 bp 得到该块脚部指针
-#define FTRP(bp) ((char *)(bp) + GET_SIZE(HDRP(bp)) - DSIZE)
-
 // 由当前块指针 bp 得到堆中下一块的块指针
 #define NEXT_BLKP(bp) ((char *)(bp) + GET_SIZE(HDRP(bp)))
-// 由当前块指针 bp 得到堆中上一块的块指针
-#define PREV_BLKP(bp) ((char *)(bp) - GET_SIZE(((char *)(bp) - DSIZE)))
+
+// 仅 free 块可用
+#define FTRP_FREE(bp) ((char *)(bp) + GET_SIZE(HDRP(bp)) - DSIZE)
+// 打包块头信息
+#define PACK_HDR(size, alloc, prev_alloc) ((size) | (alloc) | ((prev_alloc) ? PREV_ALLOC : 0))
+// 打包块脚信息
+#define PACK_FTR(size) (size)
+
+// 仅当前块 header 显示 prev 是 free 时可用
+#define PREV_BLKP_FREE(bp) ((char *)(bp) - GET_SIZE(((char *)(bp) - DSIZE)))
 // 返回空闲块 bp 中前驱指针字段的地址
 #define PRED_PTR(bp) ((void **)(bp))
 // 返回空闲块 bp 中后继指针字段的地址
@@ -80,50 +93,8 @@ team_t team = {
 static char *heap_listp = NULL;     // 指向序言快 payload的指针
 static void **seg_list_base = NULL; // 指向分离空闲链表头指针数组的起始地址
 
-/*
- * list_index - 混合分桶策略
- *
- * 分桶规则 (LIST_MAX = 32):
- * [16, 128]    步长 8B   -> idx 0 ~ 14
- * (128, 256]   步长 16B  -> idx 15 ~ 22
- * > 256        阈值表    -> idx 23 ~ 31
- */
-static inline int list_index(size_t size)
-{
-    if (size <= 16)
-    {
-        return 0;
-    }
-
-    // 16 ~ 128, 步长 8B
-    if (size <= 128)
-    {
-        return (int)((size >> 3) - 2);
-    }
-
-    // 128 ~ 256, 步长 16B
-    if (size <= 256)
-    {
-        return (int)(((size + 15) >> 4) + 6);
-    }
-
-    // > 256, 用阈值表映射到idx 23~31
-    if (size > 256)
-    {
-        static const size_t limits[9] = {512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, (size_t)-1};
-
-        for (int i = 0; i < 9; i++)
-        {
-            if (size <= limits[i])
-            {
-                return 23 + i;
-            }
-        }
-    }
-
-    return LIST_MAX - 1; // 超过最大限制,放到最后一个链表
-}
-
+// 计算块大小对应的分离链表下标
+static inline int list_index(size_t size);
 // 插入空闲块
 static void insert_free_block(void *bp);
 // 删除空闲块
@@ -153,9 +124,7 @@ static void place(void *bp, size_t asize);
 int mm_init(void)
 {
     // 在堆上申请 LIST_MAX 个 void* 的空间,存放各链表的头指针
-    size_t bytes = LIST_MAX * PTRSIZE;
-    bytes = ALIGN(bytes); // 保证数组本身按8字节对齐
-
+    size_t bytes = ALIGN(LIST_MAX * PTRSIZE);
     void *p = mem_sbrk(bytes);
 
     if (p == (void *)-1)
@@ -178,10 +147,10 @@ int mm_init(void)
     }
 
     // 内存布局：[填充字][序言头][序言脚][结尾头]
-    PUT(heap_listp + 0, 0);                      // 对齐填充字
-    PUT(heap_listp + 1 * WSIZE, PACK(DSIZE, 1)); // 序言头：大小为 DSIZE，已分配
-    PUT(heap_listp + 2 * WSIZE, PACK(DSIZE, 1)); // 序言脚：同上
-    PUT(heap_listp + 3 * WSIZE, PACK(0, 1));     // 结尾块头：大小为 0，已分配
+    PUT(heap_listp + 0, 0);                             // 对齐填充字
+    PUT(heap_listp + 1 * WSIZE, PACK_HDR(DSIZE, 1, 1)); // 序言头：大小为 DSIZE，已分配
+    PUT(heap_listp + 2 * WSIZE, PACK_FTR(DSIZE));       // 序言脚：同上
+    PUT(heap_listp + 3 * WSIZE, PACK_HDR(0, 1, 1));     // 结尾块头：大小为 0，已分配
 
     // heap_listp 指向序言块 payload
     heap_listp += 2 * WSIZE;
@@ -250,10 +219,14 @@ void mm_free(void *ptr)
     }
 
     size_t size = GET_SIZE(HDRP(ptr));
+    int prev_alloc = GET_PREV_ALLOC(HDRP(ptr));
 
-    // 将块头和块脚的 alloc 标志清零,标记为空闲
-    PUT(HDRP(ptr), PACK(size, 0));
-    PUT(FTRP(ptr), PACK(size, 0));
+    // 当前块变空闲块,更新头脚部信息
+    PUT(HDRP(ptr), PACK_HDR(size, 0, prev_alloc));
+    PUT(FTRP_FREE(ptr), PACK_FTR(size));
+
+    // 后继块看到前块是空闲块
+    CLR_NEXT_PREV_ALLOC(ptr);
 
     // 立即尝试与前后空闲块合并
     coalesce(ptr);
@@ -288,6 +261,9 @@ void *mm_realloc(void *ptr, size_t size)
     // 新需求块总大小(对齐 + 头脚 + 最小块约束)
     size_t asize = adjust_block_size(size);
 
+    // allocated 无footer,payload = old_size - header
+    size_t old_payload = (old_size >= WSIZE) ? (old_size - WSIZE) : 0;
+
     // 原地缩小
     if (asize <= old_size)
     {
@@ -296,14 +272,16 @@ void *mm_realloc(void *ptr, size_t size)
         // 剩余空间够形成合法空闲块则拆分,否则不拆
         if (remain >= MIN_BLOCK_SIZE)
         {
+            // 获取前块分配状态
+            int prev_alloc = GET_PREV_ALLOC(HDRP(ptr));
+
             // 当前块缩成asize
-            PUT(HDRP(ptr), PACK(asize, 1));
-            PUT(FTRP(ptr), PACK(asize, 1));
+            PUT(HDRP(ptr), PACK_HDR(asize, 1, prev_alloc));
 
             // 构造紧随其后的空闲块
             void *new_free = NEXT_BLKP(ptr);
-            PUT(HDRP(new_free), PACK(remain, 0));
-            PUT(FTRP(new_free), PACK(remain, 0));
+            PUT(HDRP(new_free), PACK_HDR(remain, 0, 1));
+            PUT(FTRP_FREE(new_free), PACK_FTR(remain));
 
             // 新空闲块可能与后继空闲块相邻,交给 coalesce 合并
             coalesce(new_free);
@@ -317,10 +295,6 @@ void *mm_realloc(void *ptr, size_t size)
     size_t next_size = GET_SIZE(HDRP(next));
     int next_alloc = GET_ALLOC(HDRP(next));
 
-    void *prev = PREV_BLKP(ptr);
-    size_t prev_size = GET_SIZE(HDRP(prev));
-    int prev_alloc = GET_ALLOC(FTRP(prev));
-
     if (!next_alloc)
     {
         size_t combined = old_size + next_size;
@@ -330,17 +304,17 @@ void *mm_realloc(void *ptr, size_t size)
             // 将后继空闲块从分离链表中摘除
             remove_free_block(next);
 
+            int prev_alloc = GET_PREV_ALLOC(HDRP(ptr));
             size_t remain = combined - asize;
 
             if (remain >= MIN_BLOCK_SIZE)
             {
                 // 合并后可拆分出新的空闲块
-                PUT(HDRP(ptr), PACK(asize, 1));
-                PUT(FTRP(ptr), PACK(asize, 1));
+                PUT(HDRP(ptr), PACK_HDR(asize, 1, prev_alloc));
 
                 void *split = NEXT_BLKP(ptr);
-                PUT(HDRP(split), PACK(remain, 0));
-                PUT(FTRP(split), PACK(remain, 0));
+                PUT(HDRP(split), PACK_HDR(remain, 0, 1));
+                PUT(FTRP_FREE(split), PACK_FTR(remain));
 
                 // 将其与可能的后继空闲块合并
                 coalesce(split);
@@ -348,8 +322,8 @@ void *mm_realloc(void *ptr, size_t size)
             else
             {
                 // 剩余空间太小,整块并入当前块
-                PUT(HDRP(ptr), PACK(combined, 1));
-                PUT(FTRP(ptr), PACK(combined, 1));
+                PUT(HDRP(ptr), PACK_HDR(combined, 1, prev_alloc));
+                SET_NEXT_PREV_ALLOC(ptr);
             }
             return ptr;
         }
@@ -358,7 +332,7 @@ void *mm_realloc(void *ptr, size_t size)
         void *next_next = NEXT_BLKP(next);
         if (GET_SIZE(HDRP(next_next)) == 0 && GET_ALLOC(HDRP(next_next)) == 1)
         {
-            size_t need_more = asize - (old_size + next_size);
+            size_t need_more = asize - combined;
 
             // 先摘掉 next
             remove_free_block(next);
@@ -379,99 +353,35 @@ void *mm_realloc(void *ptr, size_t size)
                 // 将new_next从空闲链表摘除
                 remove_free_block(new_next);
 
-                size_t total = old_size + next_size + new_next_size;
+                size_t total = old_size + new_next_size;
                 size_t remain = total - asize;
+                int prev_alloc = GET_PREV_ALLOC(HDRP(ptr));
 
                 if (remain >= MIN_BLOCK_SIZE)
                 {
                     // 合并后可拆分出新的空闲块
-                    PUT(HDRP(ptr), PACK(asize, 1));
-                    PUT(FTRP(ptr), PACK(asize, 1));
+                    PUT(HDRP(ptr), PACK_HDR(asize, 1, prev_alloc));
 
                     void *split = NEXT_BLKP(ptr);
-                    PUT(HDRP(split), PACK(remain, 0));
-                    PUT(FTRP(split), PACK(remain, 0));
+                    PUT(HDRP(split), PACK_HDR(remain, 0, 1));
+                    PUT(FTRP_FREE(split), PACK_FTR(remain));
 
                     coalesce(split);
                 }
                 else
                 {
                     // 剩余空间太小,整块并入当前块
-                    PUT(HDRP(ptr), PACK(total, 1));
-                    PUT(FTRP(ptr), PACK(total, 1));
+                    PUT(HDRP(ptr), PACK_HDR(total, 1, prev_alloc));
+                    SET_NEXT_PREV_ALLOC(ptr);
                 }
                 return ptr;
             }
-        }
-    }
-
-    // prev 和 next 都空闲,合并两边
-    if (!prev_alloc && !next_alloc)
-    {
-        size_t total = prev_size + old_size + next_size;
-
-        if (total >= asize)
-        {
-            // 将前后空闲块从分离链表中摘除
-            remove_free_block(prev);
-            remove_free_block(next);
-
-            // 合并后新块起点在prev,把旧的 payload 向前搬
-            size_t copy_bytes = old_size - DSIZE;
-            memmove(prev, ptr, copy_bytes);
-
-            size_t remain = total - asize;
-
-            if (remain >= MIN_BLOCK_SIZE)
-            {
-                // 合并后可拆分出新的空闲块
-                PUT(HDRP(prev), PACK(asize, 1));
-                PUT(FTRP(prev), PACK(asize, 1));
-
-                void *split = NEXT_BLKP(prev);
-                PUT(HDRP(split), PACK(remain, 0));
-                PUT(FTRP(split), PACK(remain, 0));
-
-                coalesce(split);
-            }
             else
             {
-                // 剩余空间太小,整块并入当前块
-                PUT(HDRP(prev), PACK(total, 1));
-                PUT(FTRP(prev), PACK(total, 1));
+                // 扩展堆失败,恢复 next 状态
+                insert_free_block(next);
             }
-            return prev;
         }
-    }
-
-    // prev 空闲，尝试向前扩容
-    if (!prev_alloc && (prev_size + old_size >= asize))
-    {
-        remove_free_block(prev);
-
-        size_t total = prev_size + old_size;
-        size_t remain = total - asize;
-
-        size_t copy_bytes = old_size - DSIZE;
-        memmove(prev, ptr, copy_bytes);
-
-        if (remain >= MIN_BLOCK_SIZE)
-        {
-            PUT(HDRP(prev), PACK(asize, 1));
-            PUT(FTRP(prev), PACK(asize, 1));
-
-            void *split = NEXT_BLKP(prev);
-            PUT(HDRP(split), PACK(remain, 0));
-            PUT(FTRP(split), PACK(remain, 0));
-            coalesce(split);
-        }
-        else
-        {
-            PUT(HDRP(prev), PACK(total, 1));
-            PUT(FTRP(prev), PACK(total, 1));
-        }
-
-        return prev;
     }
 
     // next 是 结尾块，扩堆后原地扩容
@@ -487,31 +397,106 @@ void *mm_realloc(void *ptr, size_t size)
         if (extend_heap(words) != NULL)
         {
             void *new_next = NEXT_BLKP(ptr);
-            size_t new_next_size = GET_SIZE(HDRP(new_next));
 
-            /* new_next 在空闲链表里，摘掉并入 */
-            remove_free_block(new_next);
+            if (!GET_ALLOC(HDRP(new_next)))
+            {
+                size_t new_next_size = GET_SIZE(HDRP(new_next));
+                remove_free_block(new_next);
 
-            size_t total = old_size + new_next_size;
+                size_t total = old_size + new_next_size;
+                size_t remain = total - asize;
+                int prev_alloc = GET_PREV_ALLOC(HDRP(ptr));
+
+                if (remain >= MIN_BLOCK_SIZE)
+                {
+                    PUT(HDRP(ptr), PACK_HDR(asize, 1, prev_alloc));
+
+                    void *split = NEXT_BLKP(ptr);
+                    PUT(HDRP(split), PACK_HDR(remain, 0, 1));
+                    PUT(FTRP_FREE(split), PACK_FTR(remain));
+
+                    coalesce(split);
+                }
+                else
+                {
+                    PUT(HDRP(ptr), PACK_HDR(total, 1, prev_alloc));
+                    SET_NEXT_PREV_ALLOC(ptr);
+                }
+                return ptr;
+            }
+        }
+    }
+
+    // prev 空闲，尝试向前扩容
+    int curr_prev_alloc = GET_PREV_ALLOC(HDRP(ptr));
+    if (!curr_prev_alloc)
+    {
+        void *prev = PREV_BLKP_FREE(ptr);
+        size_t prev_size = GET_SIZE(HDRP(prev));
+
+        // 先合并prev
+        if (prev_size + old_size >= asize)
+        {
+            int prev_prev_alloc = GET_PREV_ALLOC(HDRP(prev));
+            remove_free_block(prev);
+
+            // 把ptr数据搬到prev
+            size_t copy_bytes = old_payload;
+            memmove(prev, ptr, copy_bytes);
+
+            size_t total = prev_size + old_size;
             size_t remain = total - asize;
 
             if (remain >= MIN_BLOCK_SIZE)
             {
-                PUT(HDRP(ptr), PACK(asize, 1));
-                PUT(FTRP(ptr), PACK(asize, 1));
+                PUT(HDRP(prev), PACK_HDR(asize, 1, prev_prev_alloc));
 
-                void *split = NEXT_BLKP(ptr);
-                PUT(HDRP(split), PACK(remain, 0));
-                PUT(FTRP(split), PACK(remain, 0));
+                void *split = NEXT_BLKP(prev);
+                PUT(HDRP(split), PACK_HDR(remain, 0, 1));
+                PUT(FTRP_FREE(split), PACK_FTR(remain));
                 coalesce(split);
             }
             else
             {
-                PUT(HDRP(ptr), PACK(total, 1));
-                PUT(FTRP(ptr), PACK(total, 1));
+                PUT(HDRP(prev), PACK_HDR(total, 1, prev_prev_alloc));
+                SET_NEXT_PREV_ALLOC(prev);
             }
+            return prev;
+        }
 
-            return ptr;
+        // 在尝试合并 prev + next
+        if (!GET_ALLOC(HDRP(next)))
+        {
+            size_t total = prev_size + old_size + GET_SIZE(HDRP(next));
+
+            if (total >= asize)
+            {
+                int prev_prev_alloc = GET_PREV_ALLOC(HDRP(prev));
+                remove_free_block(prev);
+                remove_free_block(next);
+
+                // 把ptr数据搬到prev
+                size_t copy_bytes = old_payload;
+                memmove(prev, ptr, copy_bytes);
+
+                size_t remain = total - asize;
+
+                if (remain >= MIN_BLOCK_SIZE)
+                {
+                    PUT(HDRP(prev), PACK_HDR(asize, 1, prev_prev_alloc));
+
+                    void *split = NEXT_BLKP(prev);
+                    PUT(HDRP(split), PACK_HDR(remain, 0, 1));
+                    PUT(FTRP_FREE(split), PACK_FTR(remain));
+                    coalesce(split);
+                }
+                else
+                {
+                    PUT(HDRP(prev), PACK_HDR(total, 1, prev_prev_alloc));
+                    SET_NEXT_PREV_ALLOC(prev);
+                }
+                return prev;
+            }
         }
     }
 
@@ -522,9 +507,7 @@ void *mm_realloc(void *ptr, size_t size)
         return NULL;
     }
 
-    size_t old_payload = old_size - 2 * WSIZE;
     size_t copy_size = (size < old_payload) ? size : old_payload;
-
     memcpy(new_ptr, ptr, copy_size);
     mm_free(ptr);
 
@@ -588,27 +571,17 @@ static void remove_free_block(void *bp)
  */
 static size_t adjust_block_size(size_t size)
 {
-    size_t asize;
     if (size == 0)
     {
         return 0; // 无效请求,后续直接返回 NULL
     }
 
-    if (size <= DSIZE)
+    size_t asize = ALIGN(size + DSIZE); // 先加头部大小再对齐
+    if (asize < MIN_BLOCK_SIZE)
     {
         // 对于很小的请求,直接返回最小块大小
         asize = MIN_BLOCK_SIZE;
     }
-    else
-    {
-        // size + 头 + 脚,再用 ALIGN 对齐
-        asize = ALIGN(size + 2 * WSIZE);
-        if (asize < MIN_BLOCK_SIZE)
-        {
-            asize = MIN_BLOCK_SIZE;
-        }
-    }
-
     return asize;
 }
 
@@ -648,12 +621,15 @@ static void *extend_heap(size_t words)
         return NULL; // 扩展失败
     }
 
-    // 将获得的空间初始化为: 一个空闲块 + 一个新的结尾块
-    PUT(HDRP(bp), PACK(size, 0)); // 新空闲块头部
-    PUT(FTRP(bp), PACK(size, 0)); // 新空闲块脚部
+    // 获取前块的分配状态
+    int prev_alloc = GET_PREV_ALLOC(HDRP(bp));
 
-    void *new_epilogue = NEXT_BLKP(bp);  // 新结尾块位置
-    PUT(HDRP(new_epilogue), PACK(0, 1)); // 结尾块头,大小为0,已分配
+    // 初始化新空闲块的头部和脚部
+    PUT(HDRP(bp), PACK_HDR(size, 0, prev_alloc)); // 新空闲块头部
+    PUT(FTRP_FREE(bp), PACK_FTR(size));           // 新空闲块脚部
+
+    // 初始化新的结尾块
+    PUT(HDRP(NEXT_BLKP(bp)), PACK_HDR(0, 1, 0)); // 结尾块头,大小为0,已分配
 
     // 尝试与前块合并,并把合并结果插入空闲链表
     return coalesce(bp);
@@ -667,50 +643,61 @@ static void *extend_heap(size_t words)
  */
 static void *coalesce(void *bp)
 {
-    void *prev = PREV_BLKP(bp); // bp 前一块
-    void *next = NEXT_BLKP(bp); // bp 后一块
+    size_t size = GET_SIZE(HDRP(bp));
 
-    int prev_alloc = GET_ALLOC(FTRP(prev)); // 前块是否已分配
-    int next_alloc = GET_ALLOC(HDRP(next)); // 后块是否已分配
-    size_t size = GET_SIZE(HDRP(bp));       // 当前块大小
+    int prev_alloc = GET_PREV_ALLOC(HDRP(bp));
+    void *next = NEXT_BLKP(bp);
+    int next_alloc = GET_ALLOC(HDRP(next));
+
+    void *prev = NULL;
+    int prev_prev_alloc = 1; // 前前块分配标志,默认为1
+
+    // 只有当 prev_alloc 为0时,才有必要获取前块指针
+    if (!prev_alloc)
+    {
+        prev = PREV_BLKP_FREE(bp);
+        prev_prev_alloc = GET_PREV_ALLOC(HDRP(prev));
+    }
 
     if (prev_alloc && next_alloc)
     {
         // 前后都已分配,不发生合并
-        insert_free_block(bp);
     }
     else if (prev_alloc && !next_alloc)
     {
         // 前分配,后空闲,与后块合并
-        remove_free_block(next);      // 将后块从空闲链表中摘除
-        size += GET_SIZE(HDRP(next)); // 合并后大小
-        PUT(HDRP(bp), PACK(size, 0)); // 更新当前块头
-        PUT(FTRP(bp), PACK(size, 0)); // 更新当前块脚
-        insert_free_block(bp);        // 插回空闲链表
+        remove_free_block(next);             // 将后块从空闲链表中摘除
+        size += GET_SIZE(HDRP(next));        // 合并后大小
+        PUT(HDRP(bp), PACK_HDR(size, 0, 1)); // 更新当前块头
+        PUT(FTRP_FREE(bp), PACK_FTR(size));  // 更新当前块脚
     }
     else if (!prev_alloc && next_alloc)
     {
         // 前空闲,后分配,与前块合并
-        remove_free_block(prev);        // 将前块从空闲链表中摘除
-        size += GET_SIZE(HDRP(prev));   // 合并后大小
-        PUT(HDRP(prev), PACK(size, 0)); // 更新当前块头
-        PUT(FTRP(bp), PACK(size, 0));   // 更新当前块脚
-        bp = prev;                      // 合并后的块起点为prev
-        insert_free_block(bp);          // 插回空闲链表
+        remove_free_block(prev);      // 将前块从空闲链表中摘除
+        size += GET_SIZE(HDRP(prev)); // 合并后大小
+
+        bp = prev;                                         // 合并后的块起点为prev
+        PUT(HDRP(bp), PACK_HDR(size, 0, prev_prev_alloc)); // 更新当前块头
+        PUT(FTRP_FREE(bp), PACK_FTR(size));                // 更新当前块脚
     }
     else
     {
         // 前后都空闲,三块一起合并
         remove_free_block(prev);
         remove_free_block(next);
-
         size += GET_SIZE(HDRP(prev)) + GET_SIZE(HDRP(next));
-        PUT(HDRP(prev), PACK(size, 0)); // 新头在 prev
-        PUT(FTRP(next), PACK(size, 0)); // 新脚在next的脚部位置
+
         bp = prev;
-        insert_free_block(bp);
+        PUT(HDRP(bp), PACK_HDR(size, 0, prev_prev_alloc)); // 新头在 prev
+        PUT(FTRP_FREE(bp), PACK_FTR(size));                // 新脚在next的脚部位置
     }
 
+    // 合并后的块是空闲的,后继块 prev_alloc 位清0
+    CLR_NEXT_PREV_ALLOC(bp);
+
+    // 将合并后的空闲块插入分离链表
+    insert_free_block(bp);
     return bp;
 }
 
@@ -791,26 +778,73 @@ static void place(void *bp, size_t asize)
     // 将该空闲块从空闲链表中删除
     remove_free_block(bp);
 
+    int prev_alloc = GET_PREV_ALLOC(HDRP(bp)); // 获取前块分配状态
+
     if (remain >= MIN_BLOCK_SIZE)
     {
         // 可以分割
         // 前半部分: 已分配块
-        PUT(HDRP(bp), PACK(asize, 1));
-        PUT(FTRP(bp), PACK(asize, 1));
+        PUT(HDRP(bp), PACK_HDR(asize, 1, prev_alloc));
 
         // 找到剩余部分的指针
         void *next = NEXT_BLKP(bp);
 
         // 后半部分: 新空闲块
-        PUT(HDRP(next), PACK(remain, 0));
-        PUT(FTRP(next), PACK(remain, 0));
+        PUT(HDRP(next), PACK_HDR(remain, 0, 1));
+        PUT(FTRP_FREE(next), PACK_FTR(remain));
 
         coalesce(next); // 与可能的后继空闲块合并
     }
     else
     {
         // 剩余空间不足以形成一个最小块,整块直接分配
-        PUT(HDRP(bp), PACK(csize, 1));
-        PUT(FTRP(bp), PACK(csize, 1));
+        PUT(HDRP(bp), PACK_HDR(csize, 1, prev_alloc));
+
+        // 后继块看到前块是已分配块
+        SET_NEXT_PREV_ALLOC(bp);
     }
+}
+
+/*
+ * list_index - 混合分桶策略
+ *
+ * 分桶规则 (LIST_MAX = 32):
+ * [16, 128]    步长 8B   -> idx 0 ~ 14
+ * (128, 256]   步长 16B  -> idx 15 ~ 22
+ * > 256        阈值表    -> idx 23 ~ 31
+ */
+static inline int list_index(size_t size)
+{
+    if (size <= 16)
+    {
+        return 0;
+    }
+
+    // 16 ~ 128, 步长 8B
+    if (size <= 128)
+    {
+        return (int)((size >> 3) - 2);
+    }
+
+    // 128 ~ 256, 步长 16B
+    if (size <= 256)
+    {
+        return (int)(((size + 15) >> 4) + 6);
+    }
+
+    // > 256, 用阈值表映射到idx 23~31
+    if (size > 256)
+    {
+        static const size_t limits[9] = {512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, (size_t)-1};
+
+        for (int i = 0; i < 9; i++)
+        {
+            if (size <= limits[i])
+            {
+                return 23 + i;
+            }
+        }
+    }
+
+    return LIST_MAX - 1; // 超过最大限制,放到最后一个链表
 }
