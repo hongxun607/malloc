@@ -47,7 +47,9 @@ team_t team = {
 #define PTRSIZE (sizeof(void *))                        // 指针大小
 #define CHUNKSIZE (1 << 12)                             // 定义初始堆大小为 4KB
 #define MIN_BLOCK_SIZE (ALIGN(2 * WSIZE + 2 * PTRSIZE)) // 最小块大小
-#define LIST_MAX 24                                     // 分离空闲链表的条数
+#define LIST_MAX 32                                     // 分离空闲链表的条数
+#define FIRST_FIT_MAX_IDX 22                            // 采用首次适配策略的链表最大下标
+#define BEST_FIT_SCAN_LIMIT 64                          // 最佳适配策略的扫描块数上限
 
 // 将块大小 size 和分配标志 alloc 打包到一个字中
 #define PACK(size, alloc) ((size) | (alloc))
@@ -78,39 +80,48 @@ team_t team = {
 static char *heap_listp = NULL;     // 指向序言快 payload的指针
 static void **seg_list_base = NULL; // 指向分离空闲链表头指针数组的起始地址
 
+/*
+ * list_index - 混合分桶策略
+ *
+ * 分桶规则 (LIST_MAX = 32):
+ * [16, 128]    步长 8B   -> idx 0 ~ 14
+ * (128, 256]   步长 16B  -> idx 15 ~ 22
+ * > 256        阈值表    -> idx 23 ~ 31
+ */
 static inline int list_index(size_t size)
 {
-    /* 1) 先确保最小块尺寸对齐 */
     if (size <= 16)
+    {
         return 0;
+    }
 
-    /* 2) 小块：16B 对齐的线性桶，覆盖到 256B（共 15 个桶: 0..14）*/
+    // 16 ~ 128, 步长 8B
+    if (size <= 128)
+    {
+        return (int)((size >> 3) - 2);
+    }
+
+    // 128 ~ 256, 步长 16B
     if (size <= 256)
     {
-        int idx = (int)((size + 15) / 16) - 1; // 16,32,...,256
-        if (idx < 0)
-            idx = 0;
-        if (idx > 14)
-            idx = 14;
-        return idx;
+        return (int)(((size + 15) >> 4) + 6);
     }
-    if (size <= 512)
-        return 15;
-    if (size <= 1024)
-        return 16;
-    if (size <= 2048)
-        return 17;
-    if (size <= 4096)
-        return 18;
-    if (size <= 8192)
-        return 19;
-    if (size <= 16384)
-        return 20;
-    if (size <= 32768)
-        return 21;
-    if (size <= 65536)
-        return 22;
-    return 23;
+
+    // > 256, 用阈值表映射到idx 23~31
+    if (size > 256)
+    {
+        static const size_t limits[9] = {512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, (size_t)-1};
+
+        for (int i = 0; i < 9; i++)
+        {
+            if (size <= limits[i])
+            {
+                return 23 + i;
+            }
+        }
+    }
+
+    return LIST_MAX - 1; // 超过最大限制,放到最后一个链表
 }
 
 // 插入空闲块
