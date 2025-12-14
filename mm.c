@@ -49,7 +49,7 @@ team_t team = {
 #define MIN_BLOCK_SIZE (ALIGN(2 * WSIZE + 2 * PTRSIZE)) // 最小块大小
 #define LIST_MAX 32                                     // 分离空闲链表的条数
 #define FIRST_FIT_MAX_IDX 22                            // 采用首次适配策略的链表最大下标
-#define BEST_FIT_SCAN_LIMIT 512                         // 最佳适配策略的扫描块数上限
+#define BEST_FIT_SCAN_LIMIT 1024                        // 最佳适配策略的扫描块数上限
 #define PREV_ALLOC 0x2                                  // 前块分配标志位
 
 // 改写某个块头的 prev_alloc 位
