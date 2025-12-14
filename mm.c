@@ -49,7 +49,7 @@ team_t team = {
 #define MIN_BLOCK_SIZE (ALIGN(2 * WSIZE + 2 * PTRSIZE)) // 最小块大小
 #define LIST_MAX 32                                     // 分离空闲链表的条数
 #define FIRST_FIT_MAX_IDX 22                            // 采用首次适配策略的链表最大下标
-#define BEST_FIT_SCAN_LIMIT 128                         // 最佳适配策略的扫描块数上限
+#define BEST_FIT_SCAN_LIMIT 512                         // 最佳适配策略的扫描块数上限
 #define PREV_ALLOC 0x2                                  // 前块分配标志位
 
 // 改写某个块头的 prev_alloc 位
@@ -270,7 +270,7 @@ void *mm_realloc(void *ptr, size_t size)
         size_t remain = old_size - asize;
 
         // 剩余空间够形成合法空闲块则拆分,否则不拆
-        if (remain >= MIN_BLOCK_SIZE)
+        if (remain >= MIN_BLOCK_SIZE * 8)
         {
             // 获取前块分配状态
             int prev_alloc = GET_PREV_ALLOC(HDRP(ptr));
@@ -576,7 +576,7 @@ static size_t adjust_block_size(size_t size)
         return 0; // 无效请求,后续直接返回 NULL
     }
 
-    size_t asize = ALIGN(size + DSIZE); // 先加头部大小再对齐
+    size_t asize = ALIGN(size + WSIZE); // 先加头部大小再对齐
     if (asize < MIN_BLOCK_SIZE)
     {
         // 对于很小的请求,直接返回最小块大小
