@@ -47,9 +47,7 @@ team_t team = {
 #define PTRSIZE (sizeof(void *))                        // 指针大小
 #define CHUNKSIZE (1 << 12)                             // 定义初始堆大小为 4KB
 #define MIN_BLOCK_SIZE (ALIGN(2 * WSIZE + 2 * PTRSIZE)) // 最小块大小
-#define LIST_MAX 32                                     // 分离空闲链表的条数
-#define FIRST_FIT_MAX_IDX 22                            // 采用首次适配策略的链表最大下标
-#define BEST_FIT_SCAN_LIMIT 64                          // 最佳适配策略的扫描块数上限
+#define LIST_MAX 24                                     // 分离空闲链表的条数
 
 // 将块大小 size 和分配标志 alloc 打包到一个字中
 #define PACK(size, alloc) ((size) | (alloc))
@@ -80,56 +78,39 @@ team_t team = {
 static char *heap_listp = NULL;     // 指向序言快 payload的指针
 static void **seg_list_base = NULL; // 指向分离空闲链表头指针数组的起始地址
 
-/*
- * list_index - 混合分桶策略
- * 分桶规则 (LIST_MAX = 32):
- * [16, 128]    步长 8B   -> idx 0 ~ 14
- * (128, 256]   步长 16B  -> idx 15 ~ 22
- * (256, 2048]  特定阈值  -> idx 23 ~ 30
- * > 2048       大块      -> idx 31
- */
 static inline int list_index(size_t size)
 {
-    /* ---------------- 小块区 (0 ~ 256B) 保持不变 ---------------- */
+    /* 1) 先确保最小块尺寸对齐 */
+    if (size <= 16)
+        return 0;
 
-    /* 桶 0~14: 16~128B (步长 8B) */
-    if (size <= 128)
-    {
-        return (int)((size >> 3) - 2);
-    }
-
-    /* 桶 15~22: 129~256B (步长 16B) */
+    /* 2) 小块：16B 对齐的线性桶，覆盖到 256B（共 15 个桶: 0..14）*/
     if (size <= 256)
     {
-        return (int)(((size + 15) >> 4) + 6);
+        int idx = (int)((size + 15) / 16) - 1; // 16,32,...,256
+        if (idx < 0)
+            idx = 0;
+        if (idx > 14)
+            idx = 14;
+        return idx;
     }
-
-    /* ---------------- 大块区 (> 256B) 稀疏分桶 ---------------- */
-    /* * 之前的问题是把 >2048 都扔进了桶 31。
-     * 现在我们利用剩下的桶 (23 ~ 31) 进行指数级稀疏划分。
-     */
-
     if (size <= 512)
-        return 23;
+        return 15;
     if (size <= 1024)
-        return 24;
+        return 16;
     if (size <= 2048)
-        return 25;
+        return 17;
     if (size <= 4096)
-        return 26;
+        return 18;
     if (size <= 8192)
-        return 27;
-
-    /* 还有很多桶可以用，继续分！ */
+        return 19;
     if (size <= 16384)
-        return 28; // 16KB
+        return 20;
     if (size <= 32768)
-        return 29; // 32KB
+        return 21;
     if (size <= 65536)
-        return 30; // 64KB - Trace 9 经常在这个范围
-
-    /* 只有真正巨大的块 (>64KB) 才进最后一个桶 */
-    return 31;
+        return 22;
+    return 23;
 }
 
 // 插入空闲块
