@@ -270,7 +270,7 @@ void *mm_realloc(void *ptr, size_t size)
         size_t remain = old_size - asize;
 
         // 剩余空间够形成合法空闲块则拆分,否则不拆
-        if (remain >= MIN_BLOCK_SIZE * 8)
+        if (remain >= MIN_BLOCK_SIZE)
         {
             // 获取前块分配状态
             int prev_alloc = GET_PREV_ALLOC(HDRP(ptr));
