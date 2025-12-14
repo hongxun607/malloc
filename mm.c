@@ -47,7 +47,9 @@ team_t team = {
 #define PTRSIZE (sizeof(void *))                        // 指针大小
 #define CHUNKSIZE (1 << 12)                             // 定义初始堆大小为 4KB
 #define MIN_BLOCK_SIZE (ALIGN(2 * WSIZE + 2 * PTRSIZE)) // 最小块大小
-#define LIST_MAX 20                                     // 分离空闲链表的条数
+#define LIST_MAX 32                                     // 分离空闲链表的条数
+#define FIRST_FIT_MAX_IDX 22                            // 采用首次适配策略的链表最大下标
+#define BEST_FIT_SCAN_LIMIT 64                          // 最佳适配策略的扫描块数上限
 
 // 将块大小 size 和分配标志 alloc 打包到一个字中
 #define PACK(size, alloc) ((size) | (alloc))
@@ -78,20 +80,58 @@ team_t team = {
 static char *heap_listp = NULL;     // 指向序言快 payload的指针
 static void **seg_list_base = NULL; // 指向分离空闲链表头指针数组的起始地址
 
-// 根据块大小 size 计算其对应的分离空闲链表下标
-// 使用指数划分,块越大,下标越大,最大为LIST_MAX - 1
+/*
+ * list_index - 混合分桶策略
+ * 分桶规则 (LIST_MAX = 32):
+ * [16, 128]    步长 8B   -> idx 0 ~ 14
+ * (128, 256]   步长 16B  -> idx 15 ~ 22
+ * (256, 2048]  特定阈值  -> idx 23 ~ 30
+ * > 2048       大块      -> idx 31
+ */
 static int list_index(size_t size)
 {
-    int idx = 0;
-    size_t s = size;
-
-    while (idx < LIST_MAX - 1 && s > 1)
+    // 避免出现负数
+    if (size <= 16)
     {
-        s >>= 1; // 不断除以2
-        idx++;
+        return 0;
     }
 
-    return idx;
+    // 小块区 16~128字节,步长8B
+    if (size <= 128)
+    {
+        return (int)((size >> 3) - 2);
+    }
+    // 小块区 128~256字节,步长16B
+    if (size <= 256)
+    {
+        return (int)(((size + 15) >> 4) + 6);
+    }
+
+    // 中块区 257~2048字节,按阈值分桶
+    if (size <= 512)
+    {
+        if (size <= 320)
+            return 23;
+        if (size <= 384)
+            return 24;
+        if (size <= 448)
+            return 25;
+        return 26; // 449 ~ 512
+    }
+
+    if (size <= 2048)
+    {
+        if (size <= 768)
+            return 27;
+        if (size <= 1024)
+            return 28;
+        if (size <= 1536)
+            return 29;
+        return 30; // 1_537 ~ 2_048
+    }
+
+    // 大块区 >2048字节
+    return 31;
 }
 
 // 插入空闲块
