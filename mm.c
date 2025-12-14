@@ -608,7 +608,8 @@ static void *coalesce(void *bp)
  *
  *策略:
  *   从 asize 对应的 size class 开始,依次向更大 size class 搜索
- *   在每条链表中使用 first-fit,找到第一个满足大小要求的块就返回
+ *   在小块区域链表(0~21)中使用 first-fit,找到第一个满足大小要求的块就返回
+ *  在大块区域链表(22~31)中使用 best-fit,扫描有限数量的块后返回最优块
  */
 static void *find_fit(size_t asize)
 {
@@ -618,11 +619,61 @@ static void *find_fit(size_t asize)
     for (int i = idx; i < LIST_MAX; i++)
     {
         void *bp = seg_list_base[i];
-        for (; bp != NULL; bp = *SUCC_PTR(bp))
+
+        // 小块区域链表使用 first-fit 策略
+        if (i <= FIRST_FIT_MAX_IDX)
         {
-            if (GET_SIZE(HDRP(bp)) >= asize)
+            while (bp != NULL)
             {
-                return bp; // 找到适配块
+                if (GET_SIZE(HDRP(bp)) >= asize)
+                {
+                    return bp; // 找到合适块,返回
+                }
+                bp = *SUCC_PTR(bp);
+            }
+        }
+        // 大块区域链表使用 best-fit 策略
+        else
+        {
+            void *best_bp = NULL;
+            size_t min_diff = (size_t)-1; // 初始化为最大值
+            int count = 0;                // 扫描计数器
+
+            while (bp != NULL)
+            {
+                size_t curr_size = GET_SIZE(HDRP(bp));
+
+                if (curr_size >= asize)
+                {
+                    size_t diff = curr_size - asize;
+
+                    // 完美匹配:不用找了,直接返回
+                    if (diff == 0)
+                    {
+                        return bp;
+                    }
+
+                    // 更新最优块
+                    if (diff < min_diff)
+                    {
+                        min_diff = diff;
+                        best_bp = bp;
+                    }
+
+                    // 扫描限制,防止耗时过长
+                    count++;
+                    if (count >= BEST_FIT_SCAN_LIMIT)
+                    {
+                        break;
+                    }
+                }
+                bp = *SUCC_PTR(bp);
+            }
+
+            // 如果在当前大桶里找到了合适块,就返回
+            if (best_bp != NULL)
+            {
+                return best_bp;
             }
         }
     }
@@ -638,30 +689,33 @@ static void *find_fit(size_t asize)
  *   先把 bp 从空闲链表中摘除
  *   若 csize - asize 足够大(>= MIN_BLOCK_SIZE),则进行分割:
  *       - 前半部分为已分配块(大小为 asize);
- *       - 后半部分为新的空闲块插入分离链表
+ *       - 后半部分为新的空闲块,调用coalesce合并后插入空闲链表
  *   否则:
  *       - 整块都标记为已分配
  */
 static void place(void *bp, size_t asize)
 {
     size_t csize = GET_SIZE(HDRP(bp)); // 获得当前空闲块的总大小
+    size_t remain = csize - asize;     // 剩下的空间
 
     // 将该空闲块从空闲链表中删除
     remove_free_block(bp);
 
-    if (csize - asize >= MIN_BLOCK_SIZE)
+    if (remain >= MIN_BLOCK_SIZE)
     {
         // 可以分割
         // 前半部分: 已分配块
         PUT(HDRP(bp), PACK(asize, 1));
         PUT(FTRP(bp), PACK(asize, 1));
 
-        // 后把部分: 新的空闲块
-        void *next = (char *)bp + asize;
-        PUT(HDRP(next), PACK(csize - asize, 0));
-        PUT(FTRP(next), PACK(csize - asize, 0));
+        // 找到剩余部分的指针
+        void *next = NEXT_BLKP(bp);
 
-        insert_free_block(next); // 将剩余空闲块挂到分离链表
+        // 后半部分: 新空闲块
+        PUT(HDRP(next), PACK(remain, 0));
+        PUT(FTRP(next), PACK(remain, 0));
+
+        coalesce(next); // 与可能的后继空闲块合并
     }
     else
     {
