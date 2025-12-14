@@ -49,7 +49,7 @@ team_t team = {
 #define MIN_BLOCK_SIZE (ALIGN(2 * WSIZE + 2 * PTRSIZE)) // 最小块大小
 #define LIST_MAX 32                                     // 分离空闲链表的条数
 #define FIRST_FIT_MAX_IDX 22                            // 采用首次适配策略的链表最大下标
-#define BEST_FIT_SCAN_LIMIT 64                          // 最佳适配策略的扫描块数上限
+#define BEST_FIT_SCAN_LIMIT 128                         // 最佳适配策略的扫描块数上限
 
 // 将块大小 size 和分配标志 alloc 打包到一个字中
 #define PACK(size, alloc) ((size) | (alloc))
@@ -608,76 +608,55 @@ static void *coalesce(void *bp)
  *
  *策略:
  *   从 asize 对应的 size class 开始,依次向更大 size class 搜索
- *   在小块区域链表(0~21)中使用 first-fit,找到第一个满足大小要求的块就返回
- *  在大块区域链表(22~31)中使用 best-fit,扫描有限数量的块后返回最优块
+ *  使用 best-fit 策略
  */
 static void *find_fit(size_t asize)
 {
     int idx = list_index(asize);
 
-    // 从对应 size class 开始,向更大的 class 逐个尝试
+    // 从当前 size class 开始往后找
     for (int i = idx; i < LIST_MAX; i++)
     {
         void *bp = seg_list_base[i];
+        void *best_bp = NULL;
+        size_t min_diff = (size_t)-1; // 初始化为最大值
+        int count = 0;                // 记录扫描块数
 
-        // 小块区域链表使用 first-fit 策略
-        if (i <= FIRST_FIT_MAX_IDX)
+        // Best-Fit 策略
+        while (bp != NULL)
         {
-            while (bp != NULL)
+            size_t curr_size = GET_SIZE(HDRP(bp));
+
+            if (curr_size >= asize)
             {
-                if (GET_SIZE(HDRP(bp)) >= asize)
+                size_t diff = curr_size - asize;
+
+                if (diff == 0)
                 {
-                    return bp; // 找到合适块,返回
+                    return bp; // 完美匹配,直接返回
                 }
-                bp = *SUCC_PTR(bp);
+
+                if (diff < min_diff)
+                {
+                    // 找到更优的块
+                    min_diff = diff;
+                    best_bp = bp;
+                }
+
+                // 限制扫描块数,避免过度搜索
+                count++;
+                if (count >= BEST_FIT_SCAN_LIMIT)
+                {
+                    break;
+                }
             }
+            bp = *SUCC_PTR(bp); // 继续扫描下一个空闲块
         }
-        // 大块区域链表使用 best-fit 策略
-        else
+        if (best_bp != NULL)
         {
-            void *best_bp = NULL;
-            size_t min_diff = (size_t)-1; // 初始化为最大值
-            int count = 0;                // 扫描计数器
-
-            while (bp != NULL)
-            {
-                size_t curr_size = GET_SIZE(HDRP(bp));
-
-                if (curr_size >= asize)
-                {
-                    size_t diff = curr_size - asize;
-
-                    // 完美匹配:不用找了,直接返回
-                    if (diff == 0)
-                    {
-                        return bp;
-                    }
-
-                    // 更新最优块
-                    if (diff < min_diff)
-                    {
-                        min_diff = diff;
-                        best_bp = bp;
-                    }
-
-                    // 扫描限制,防止耗时过长
-                    count++;
-                    if (count >= BEST_FIT_SCAN_LIMIT)
-                    {
-                        break;
-                    }
-                }
-                bp = *SUCC_PTR(bp);
-            }
-
-            // 如果在当前大桶里找到了合适块,就返回
-            if (best_bp != NULL)
-            {
-                return best_bp;
-            }
+            return best_bp; // 返回找到的最佳块
         }
     }
-
     // 所有链表都没有合适空闲块
     return NULL;
 }
