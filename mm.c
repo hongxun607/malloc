@@ -334,9 +334,6 @@ void *mm_realloc(void *ptr, size_t size)
         {
             size_t need_more = asize - combined;
 
-            // 先摘掉 next
-            remove_free_block(next);
-
             // 申请更多堆空间
             size_t words = (need_more + (WSIZE - 1)) / WSIZE;
             if (words < (MIN_BLOCK_SIZE / WSIZE))
@@ -347,34 +344,37 @@ void *mm_realloc(void *ptr, size_t size)
             if (extend_heap(words) != NULL)
             {
                 // 扩展后,next后继为新空闲块
-                void *new_next = NEXT_BLKP(ptr);
-                size_t new_next_size = GET_SIZE(HDRP(new_next));
+                next = NEXT_BLKP(ptr);
+                next_size = GET_SIZE(HDRP(next));
 
-                // 将new_next从空闲链表摘除
-                remove_free_block(new_next);
-
-                size_t total = old_size + new_next_size;
-                size_t remain = total - asize;
-                int prev_alloc = GET_PREV_ALLOC(HDRP(ptr));
-
-                if (remain >= MIN_BLOCK_SIZE)
+                size_t total = old_size + next_size;
+                if (total >= asize)
                 {
-                    // 合并后可拆分出新的空闲块
-                    PUT(HDRP(ptr), PACK_HDR(asize, 1, prev_alloc));
+                    // 将后继空闲块从分离链表中摘除
+                    remove_free_block(next);
 
-                    void *split = NEXT_BLKP(ptr);
-                    PUT(HDRP(split), PACK_HDR(remain, 0, 1));
-                    PUT(FTRP_FREE(split), PACK_FTR(remain));
+                    size_t remain = total - asize;
+                    int prev_alloc = GET_PREV_ALLOC(HDRP(ptr));
 
-                    coalesce(split);
+                    if (remain >= MIN_BLOCK_SIZE)
+                    {
+                        // 合并后可拆分出新的空闲块
+                        PUT(HDRP(ptr), PACK_HDR(asize, 1, prev_alloc));
+
+                        void *split = NEXT_BLKP(ptr);
+                        PUT(HDRP(split), PACK_HDR(remain, 0, 1));
+                        PUT(FTRP_FREE(split), PACK_FTR(remain));
+
+                        coalesce(split);
+                    }
+                    else
+                    {
+                        // 剩余空间太小,整块并入当前块
+                        PUT(HDRP(ptr), PACK_HDR(total, 1, prev_alloc));
+                        SET_NEXT_PREV_ALLOC(ptr);
+                    }
+                    return ptr;
                 }
-                else
-                {
-                    // 剩余空间太小,整块并入当前块
-                    PUT(HDRP(ptr), PACK_HDR(total, 1, prev_alloc));
-                    SET_NEXT_PREV_ALLOC(ptr);
-                }
-                return ptr;
             }
             else
             {
