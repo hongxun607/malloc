@@ -42,10 +42,14 @@ team_t team = {
 
 #define SIZE_T_SIZE (ALIGN(sizeof(size_t))) // 计算sizeof(size_t)的对齐后大小
 
-#define WSIZE 4                                         // 定义字大小为4字节
-#define DSIZE 8                                         // 定义双字大小为8字节
-#define PTRSIZE (sizeof(void *))                        // 指针大小
-#define CHUNKSIZE (1 << 12)                             // 定义初始堆大小为 4KB
+#define WSIZE 4                  // 定义字大小为4字节
+#define DSIZE 8                  // 定义双字大小为8字节
+#define PTRSIZE (sizeof(void *)) // 指针大小
+#define INIT_CHUNK (1 << 10)     // 1KB 初始扩堆
+#define SMALL_EXT (1 << 10)      // 1KB
+#define MID_EXT (1 << 11)        // 2KB
+#define LARGE_EXT (1 << 12)      // 4KB
+
 #define MIN_BLOCK_SIZE (ALIGN(2 * WSIZE + 2 * PTRSIZE)) // 最小块大小
 #define LIST_MAX 32                                     // 分离空闲链表的条数
 #define FIRST_FIT_MAX_IDX 22                            // 采用首次适配策略的链表最大下标
@@ -156,7 +160,7 @@ int mm_init(void)
     heap_listp += 2 * WSIZE;
 
     // 3. 扩展一块初始空闲块，大小为 CHUNKSIZE 字节
-    if (extend_heap(CHUNKSIZE / WSIZE) == NULL)
+    if (extend_heap(INIT_CHUNK / WSIZE) == NULL)
     {
         return -1;
     }
@@ -194,7 +198,20 @@ void *mm_malloc(size_t size)
     }
 
     // 若找不到合适的空闲块,则需要扩展堆
-    size_t extend_size = (asize > CHUNKSIZE) ? asize : CHUNKSIZE;
+    size_t extend_size;
+    if (asize <= 512)
+    {
+        extend_size = (asize > SMALL_EXT) ? asize : SMALL_EXT;
+    }
+    else if (asize <= 2048)
+    {
+        extend_size = (asize > MID_EXT) ? asize : MID_EXT;
+    }
+    else
+    {
+        extend_size = (asize > LARGE_EXT) ? asize : LARGE_EXT;
+    }
+
     bp = extend_heap(extend_size / WSIZE);
     if (bp == NULL)
     {
@@ -375,11 +392,6 @@ void *mm_realloc(void *ptr, size_t size)
                     }
                     return ptr;
                 }
-            }
-            else
-            {
-                // 扩展堆失败,恢复 next 状态
-                insert_free_block(next);
             }
         }
     }
@@ -716,45 +728,57 @@ static void *find_fit(size_t asize)
     for (int i = idx; i < LIST_MAX; i++)
     {
         void *bp = seg_list_base[i];
-        void *best_bp = NULL;
-        size_t min_diff = (size_t)-1; // 初始化为最大值
-        int count = 0;                // 记录扫描块数
 
-        // Best-Fit 策略
-        while (bp != NULL)
+        // 小桶 first-firt 策略
+        if (i <= FIRST_FIT_MAX_IDX)
         {
-            size_t curr_size = GET_SIZE(HDRP(bp));
-
-            if (curr_size >= asize)
+            while (bp != NULL)
             {
-                size_t diff = curr_size - asize;
+                size_t curr_size = GET_SIZE(HDRP(bp));
 
-                if (diff == 0)
+                if (curr_size >= asize)
                 {
-                    return bp; // 完美匹配,直接返回
+                    return bp; // 找到合适块,直接返回
                 }
-
-                if (diff < min_diff)
-                {
-                    // 找到更优的块
-                    min_diff = diff;
-                    best_bp = bp;
-                }
-
-                // 限制扫描块数,避免过度搜索
-                count++;
-                if (count >= BEST_FIT_SCAN_LIMIT)
-                {
-                    break;
-                }
+                bp = *SUCC_PTR(bp); // 继续扫描下一个空闲块
             }
-            bp = *SUCC_PTR(bp); // 继续扫描下一个空闲块
         }
-        if (best_bp != NULL)
+        else
         {
-            return best_bp; // 返回找到的最佳块
+            void *best_bp = NULL;
+            size_t min_diff = (size_t)-1; // 初始化为最大值
+            int count = 0;                // 记录扫描块数
+
+            // Best-Fit 策略
+            while (bp != NULL && count < BEST_FIT_SCAN_LIMIT)
+            {
+                size_t curr_size = GET_SIZE(HDRP(bp));
+
+                if (curr_size >= asize)
+                {
+                    size_t diff = curr_size - asize;
+
+                    if (diff == 0)
+                    {
+                        return bp; // 完美匹配,直接返回
+                    }
+
+                    if (diff < min_diff)
+                    {
+                        // 找到更优的块
+                        min_diff = diff;
+                        best_bp = bp;
+                    }
+                }
+                bp = *SUCC_PTR(bp); // 继续扫描下一个空闲块
+            }
+            if (best_bp != NULL)
+            {
+                return best_bp; // 返回找到的最佳块
+            }
         }
     }
+
     // 所有链表都没有合适空闲块
     return NULL;
 }
@@ -780,7 +804,7 @@ static void place(void *bp, size_t asize)
 
     int prev_alloc = GET_PREV_ALLOC(HDRP(bp)); // 获取前块分配状态
 
-    if (remain >= MIN_BLOCK_SIZE)
+    if (remain >= MIN_BLOCK_SIZE * 2)
     {
         // 可以分割
         // 前半部分: 已分配块
@@ -809,9 +833,9 @@ static void place(void *bp, size_t asize)
  * list_index - 混合分桶策略
  *
  * 分桶规则 (LIST_MAX = 32):
- * [16, 128]    步长 8B   -> idx 0 ~ 14
- * (128, 256]   步长 16B  -> idx 15 ~ 22
- * > 256        阈值表    -> idx 23 ~ 31
+ * [16, 128]    步长 8B   -> idx 0 ~ 15
+ * (128, 512]   步长 32B  -> idx 16 ~ 27
+ * > 512        指数增长    -> idx 28 ~ 31
  */
 static inline int list_index(size_t size)
 {
@@ -820,31 +844,25 @@ static inline int list_index(size_t size)
         return 0;
     }
 
-    // 16 ~ 128, 步长 8B
+    // 8~128: 每8字节一个桶
     if (size <= 128)
     {
-        return (int)((size >> 3) - 2);
+        return (int)((size + 7) >> 3) - 1;
     }
 
-    // 128 ~ 256, 步长 16B
-    if (size <= 256)
+    // 128~512: 每32字节一个桶
+    if (size <= 512)
     {
-        return (int)(((size + 15) >> 4) + 6);
+        return 16 + (int)((size - 129) >> 5);
     }
 
-    // > 256, 用阈值表映射到idx 23~31
-    if (size > 256)
+    // >512: 指数增长
+    size_t s = 512;
+    int idx = 27;
+    while (s < size && idx < LIST_MAX - 1)
     {
-        static const size_t limits[9] = {512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, (size_t)-1};
-
-        for (int i = 0; i < 9; i++)
-        {
-            if (size <= limits[i])
-            {
-                return 23 + i;
-            }
-        }
+        s <<= 1;
+        idx++;
     }
-
-    return LIST_MAX - 1; // 超过最大限制,放到最后一个链表
+    return idx;
 }
