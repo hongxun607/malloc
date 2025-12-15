@@ -52,8 +52,6 @@ team_t team = {
 
 #define MIN_BLOCK_SIZE (ALIGN(2 * WSIZE + 2 * PTRSIZE)) // 最小块大小
 #define LIST_MAX 64                                     // 分离空闲链表的条数
-#define FIRST_FIT_MAX_IDX 30                            // 采用首次适配策略的链表最大下标
-#define BEST_FIT_SCAN_LIMIT 1024                        // 最佳适配策略的扫描块数上限
 #define PREV_ALLOC 0x2                                  // 前块分配标志位
 
 // 改写某个块头的 prev_alloc 位
@@ -471,25 +469,36 @@ void *mm_realloc(void *ptr, size_t size)
     return new_ptr;
 }
 
-// 将空闲块 bp 插入对应 size class 的空闲链表表头
 static void insert_free_block(void *bp)
 {
-    // 根据块大小确定所属链表下标
-    size_t size = GET_SIZE(HDRP(bp));
-    int idx = list_index(size);
+    size_t bsz = GET_SIZE(HDRP(bp));
+    int idx = list_index(bsz);
 
-    // 当前链表的表头
-    void *head = seg_list_base[idx];
+    void *cur = seg_list_base[idx];
+    void *prev = NULL;
 
-    // 头插法,bp成为新的表头
-    *PRED_PTR(bp) = NULL; // 新头结点前驱为空
-    *SUCC_PTR(bp) = head; // 新头结点后继为原来的头结点
-    if (head != NULL)
+    /* 依大小升序插入；同大小可按地址排序，让布局更稳定（可选） */
+    while (cur != NULL)
     {
-        *PRED_PTR(head) = bp; // 原表头若存在,其前驱更新为bp
+        size_t csz = GET_SIZE(HDRP(cur));
+        if (csz > bsz)
+            break;
+        if (csz == bsz && cur > bp)
+            break; // 可选：同尺寸按地址
+        prev = cur;
+        cur = *SUCC_PTR(cur);
     }
 
-    seg_list_base[idx] = bp;
+    *PRED_PTR(bp) = prev;
+    *SUCC_PTR(bp) = cur;
+
+    if (prev != NULL)
+        *SUCC_PTR(prev) = bp;
+    else
+        seg_list_base[idx] = bp;
+
+    if (cur != NULL)
+        *PRED_PTR(cur) = bp;
 }
 
 // 将空闲块 bp 从分离空闲链表中摘除
@@ -669,62 +678,16 @@ static void *find_fit(size_t asize)
 {
     int idx = list_index(asize);
 
-    // 从当前 size class 开始往后找
     for (int i = idx; i < LIST_MAX; i++)
     {
         void *bp = seg_list_base[i];
-
-        // 小桶 first-firt 策略
-        if (i <= FIRST_FIT_MAX_IDX)
+        while (bp != NULL)
         {
-            while (bp != NULL)
-            {
-                size_t curr_size = GET_SIZE(HDRP(bp));
-
-                if (curr_size >= asize)
-                {
-                    return bp; // 找到合适块,直接返回
-                }
-                bp = *SUCC_PTR(bp); // 继续扫描下一个空闲块
-            }
-        }
-        else
-        {
-            void *best_bp = NULL;
-            size_t min_diff = (size_t)-1; // 初始化为最大值
-            int count = 0;                // 记录扫描块数
-
-            // Best-Fit 策略
-            while (bp != NULL && count < BEST_FIT_SCAN_LIMIT)
-            {
-                size_t curr_size = GET_SIZE(HDRP(bp));
-
-                if (curr_size >= asize)
-                {
-                    size_t diff = curr_size - asize;
-
-                    if (diff == 0)
-                    {
-                        return bp; // 完美匹配,直接返回
-                    }
-
-                    if (diff < min_diff)
-                    {
-                        // 找到更优的块
-                        min_diff = diff;
-                        best_bp = bp;
-                    }
-                }
-                bp = *SUCC_PTR(bp); // 继续扫描下一个空闲块
-            }
-            if (best_bp != NULL)
-            {
-                return best_bp; // 返回找到的最佳块
-            }
+            if (GET_SIZE(HDRP(bp)) >= asize)
+                return bp; // 桶内最小可用块 => best-fit（桶内）
+            bp = *SUCC_PTR(bp);
         }
     }
-
-    // 所有链表都没有合适空闲块
     return NULL;
 }
 
