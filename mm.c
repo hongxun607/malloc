@@ -755,7 +755,7 @@ static inline int list_index(size_t size)
     // 16 ~ 256: 每8字节一个桶
     if (size <= 256)
     {
-        return (int)((size + 7) >> 3) - 2;
+        return (int)(((size + 7) >> 3) - 2);
     }
 
     // 256~1024: 每32字节一个桶
