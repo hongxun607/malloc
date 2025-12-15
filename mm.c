@@ -712,7 +712,7 @@ static void place(void *bp, size_t asize)
 
     int prev_alloc = GET_PREV_ALLOC(HDRP(bp)); // 获取前块分配状态
 
-    if (remain >= MIN_BLOCK_SIZE)
+    if (remain >= MIN_BLOCK_SIZE * 2)
     {
         // 可以分割
         // 前半部分: 已分配块
