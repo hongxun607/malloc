@@ -712,7 +712,7 @@ static void place(void *bp, size_t asize)
 
     int prev_alloc = GET_PREV_ALLOC(HDRP(bp)); // 获取前块分配状态
 
-    if (remain >= MIN_BLOCK_SIZE * 2)
+    if (remain >= MIN_BLOCK_SIZE)
     {
         // 可以分割
         // 前半部分: 已分配块
@@ -755,7 +755,7 @@ static inline int list_index(size_t size)
     // 16 ~ 256: 每8字节一个桶
     if (size <= 256)
     {
-        return (int)((size + 7) >> 3) - 1;
+        return (int)((size + 7) >> 3) - 2;
     }
 
     // 256~1024: 每32字节一个桶
