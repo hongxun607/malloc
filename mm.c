@@ -49,7 +49,7 @@ team_t team = {
 #define SMALL_EXT (1 << 9)       // 512B
 #define MID_EXT (1 << 10)        // 1KB
 #define LARGE_EXT (1 << 11)      // 2KB
-#define FRONT_CUT_SIZE 96        // 前端切分大小96字节
+#define FRONT_CUT_SIZE 80        // 前端切分大小96字节
 
 #define MIN_BLOCK_SIZE (ALIGN(2 * WSIZE + 2 * PTRSIZE)) // 最小块大小
 #define LIST_MAX 64                                     // 分离空闲链表的条数
