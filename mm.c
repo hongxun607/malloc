@@ -115,7 +115,7 @@ static void *find_fit(size_t asize);
 static void *place(void *bp, size_t asize);
 
 // 对一致性检查器
-// static int mm_check(void);
+int mm_check(void);
 
 /*
  * mm_init - initialize the malloc package.
@@ -811,142 +811,148 @@ static inline int list_index(size_t size)
     return idx;
 }
 
-// static int mm_check(void)
-// {
-//     int verbose = 0;
-//     void *bp = heap_listp;
+int mm_check(void)
+{
+    int verbose = 0;
+    void *bp = heap_listp;
 
-//     if (verbose)
-//         printf("--- Heap Check Start ---\n");
+    if (verbose)
+        printf("--- Heap Check Start ---\n");
 
-//     // 检查序言块 (Prologue)
-//     // 序言块大小应为 DSIZE (8)，且已分配
-//     if ((GET_SIZE(HDRP(heap_listp)) != DSIZE) || !GET_ALLOC(HDRP(heap_listp)))
-//     {
-//         printf("Error: Bad prologue header\n");
-//         return 0;
-//     }
+    // 检查序言块 (Prologue)
+    // 序言块大小应为 DSIZE (8)，且已分配
+    if ((GET_SIZE(HDRP(heap_listp)) != DSIZE) || !GET_ALLOC(HDRP(heap_listp)))
+    {
+        printf("Error: Bad prologue header\n");
+        return 0;
+    }
 
-//     // 准备遍历堆
-//     char *heap_lo = (char *)mem_heap_lo();
-//     char *heap_hi = (char *)mem_heap_hi();
-//     int free_count_heap = 0;
+    // 准备遍历堆
+    char *heap_lo = (char *)mem_heap_lo();
+    char *heap_hi = (char *)mem_heap_hi();
+    int free_count_heap = 0;
 
-//     // 遍历堆中所有块
-//     for (bp = heap_listp; GET_SIZE(HDRP(bp)) > 0; bp = NEXT_BLKP(bp))
-//     {
-//         // 检查地址对齐
-//         if ((size_t)bp % ALIGNMENT != 0)
-//         {
-//             printf("Error: Block %p is not aligned\n", bp);
-//             return 0;
-//         }
+    // 遍历堆中所有块
+    for (bp = heap_listp; GET_SIZE(HDRP(bp)) > 0; bp = NEXT_BLKP(bp))
+    {
+        // 检查地址对齐
+        if ((size_t)bp % ALIGNMENT != 0)
+        {
+            printf("Error: Block %p is not aligned\n", bp);
+            return 0;
+        }
 
-//         // 检查堆边界
-//         if ((char *)bp < heap_lo || (char *)bp > heap_hi)
-//         {
-//             printf("Error: Block %p out of heap bounds\n", bp);
-//             return 0;
-//         }
+        // 检查堆边界
+        if ((char *)bp < heap_lo || (char *)bp > heap_hi)
+        {
+            printf("Error: Block %p out of heap bounds\n", bp);
+            return 0;
+        }
 
-//         // 检查分配位一致性 (当前块 Alloc 与 下一块 Prev_Alloc)
-//         void *next = NEXT_BLKP(bp);
-//         int curr_alloc = GET_ALLOC(HDRP(bp));
-//         if ((char *)next < heap_hi)
-//         {
-//             int next_prev_alloc = GET_PREV_ALLOC(HDRP(next));
-//             if (curr_alloc && !next_prev_alloc)
-//             {
-//                 printf("Error: Block %p is Alloc, but next block marks Prev as Free\n", bp);
-//                 return 0;
-//             }
-//             if (!curr_alloc && next_prev_alloc)
-//             {
-//                 printf("Error: Block %p is Free, but next block marks Prev as Alloc\n", bp);
-//                 return 0;
-//             }
-//         }
+        // 检查分配位一致性 (当前块 Alloc 与 下一块 Prev_Alloc)
+        void *next = NEXT_BLKP(bp);
+        int curr_alloc = GET_ALLOC(HDRP(bp));
+        if ((char *)next < heap_hi)
+        {
+            int next_prev_alloc = GET_PREV_ALLOC(HDRP(next));
+            if (curr_alloc && !next_prev_alloc)
+            {
+                printf("Error: Block %p is Alloc, but next block marks Prev as Free\n", bp);
+                return 0;
+            }
+            if (!curr_alloc && next_prev_alloc)
+            {
+                printf("Error: Block %p is Free, but next block marks Prev as Alloc\n", bp);
+                return 0;
+            }
+        }
 
-//         // 如果是空闲块
-//         if (!curr_alloc)
-//         {
-//             free_count_heap++;
+        // 如果是空闲块
+        if (!curr_alloc)
+        {
+            free_count_heap++;
 
-//             // 检查 Header 和 Footer 是否匹配 (仅空闲块有 Footer)
-//             if (GET(HDRP(bp)) != GET(FTRP_FREE(bp)))
-//             {
-//                 printf("Error: Header/Footer mismatch at %p\n", bp);
-//                 return 0;
-//             }
+            // 检查 Header 和 Footer 是否匹配 (仅空闲块有 Footer)
+            if (GET_SIZE(HDRP(bp)) != GET_SIZE(FTRP_FREE(bp)))
+            {
+                printf("Error: Header/Footer mismatch at %p\n", bp);
+                return 0;
+            }
 
-//             // 检查合并：是否存在连续空闲块？
-//             // 如果 next 也是空闲块，说明 coalesce 失败
-//             size_t next_size = GET_SIZE(HDRP(next));
-//             if (next_size > 0 && !GET_ALLOC(HDRP(next)))
-//             {
-//                 printf("Error: Consecutive free blocks at %p and %p\n", bp, next);
-//                 return 0;
-//             }
-//         }
-//     }
+            // 检查合并：是否存在连续空闲块？
+            // 如果 next 也是空闲块，说明 coalesce 失败
+            size_t next_size = GET_SIZE(HDRP(next));
+            if (next_size > 0 && !GET_ALLOC(HDRP(next)))
+            {
+                printf("Error: Consecutive free blocks at %p and %p\n", bp, next);
+                return 0;
+            }
+        }
+    }
 
-//     // 检查结尾块 (Epilogue)
-//     // 大小应为 0，且标记为已分配
-//     if ((GET_SIZE(HDRP(bp)) != 0) || !(GET_ALLOC(HDRP(bp))))
-//     {
-//         printf("Error: Bad epilogue header at %p\n", bp);
-//         return 0;
-//     }
+    // 检查结尾块 (Epilogue)
+    // 大小应为 0，且标记为已分配
+    if ((GET_SIZE(HDRP(bp)) != 0) || !(GET_ALLOC(HDRP(bp))))
+    {
+        printf("Error: Bad epilogue header at %p\n", bp);
+        return 0;
+    }
 
-//     // 检查分离空闲链表
-//     int free_count_list = 0;
-//     for (int i = 0; i < LIST_MAX; i++)
-//     {
-//         void *curr = seg_list_base[i];
-//         void *prev = NULL;
+    // 检查分离空闲链表
+    int free_count_list = 0;
+    for (int i = 0; i < LIST_MAX; i++)
+    {
+        void *curr = seg_list_base[i];
+        void *prev = NULL;
 
-//         while (curr != NULL)
-//         {
-//             free_count_list++;
+        while (curr != NULL)
+        {
+            free_count_list++;
 
-//             // 检查链表中的块是否在堆范围内
-//             if ((char *)curr < heap_lo || (char *)curr > heap_hi)
-//             {
-//                 printf("Error: Free list node %p out of bounds\n", curr);
-//                 return 0;
-//             }
+            // 检查链表中的块是否在堆范围内
+            if ((char *)curr < heap_lo || (char *)curr > heap_hi)
+            {
+                printf("Error: Free list node %p out of bounds\n", curr);
+                return 0;
+            }
 
-//             // 检查是否确实标记为 Free
-//             if (GET_ALLOC(HDRP(curr)))
-//             {
-//                 printf("Error: Allocated block %p found in free list %d\n", curr, i);
-//                 return 0;
-//             }
+            // 检查是否确实标记为 Free
+            if (GET_ALLOC(HDRP(curr)))
+            {
+                printf("Error: Allocated block %p found in free list %d\n", curr, i);
+                return 0;
+            }
 
-//             // 检查指针一致性 (Prev 的 Next 必须是自己)
-//             if (*PRED_PTR(curr) != prev)
-//             {
-//                 printf("Error: Link inconsistency at %p. PRED points to %p, expected %p\n",
-//                        curr, *PRED_PTR(curr), prev);
-//                 return 0;
-//             }
+            // 检查指针一致性 (Prev 的 Next 必须是自己)
+            if (*PRED_PTR(curr) != prev)
+            {
+                printf("Error: Link inconsistency at %p. PRED points to %p, expected %p\n",
+                       curr, *PRED_PTR(curr), prev);
+                return 0;
+            }
 
-//             // 检查分桶是否正确
-//             int expected_idx = list_index(GET_SIZE(HDRP(curr)));
-//             prev = curr;
-//             curr = *SUCC_PTR(curr);
-//         }
-//     }
+            // 检查分桶是否正确
+            int expected_idx = list_index(GET_SIZE(HDRP(curr)));
+            if (expected_idx != i)
+            {
+                printf("Error: Block %p in wrong free list %d, expected %d\n",
+                       curr, i, expected_idx);
+                return 0;
+            }
+            prev = curr;
+            curr = *SUCC_PTR(curr);
+        }
+    }
 
-//     // 交叉验证：堆遍历计数 vs 链表遍历计数
-//     if (free_count_heap != free_count_list)
-//     {
-//         printf("Error: Free block count mismatch. Heap: %d, List: %d\n",
-//                free_count_heap, free_count_list);
-//         return 0;
-//     }
+    // 交叉验证：堆遍历计数 vs 链表遍历计数
+    if (free_count_heap != free_count_list)
+    {
+        printf("Error: Free block count mismatch. Heap: %d, List: %d\n",
+               free_count_heap, free_count_list);
+        return 0;
+    }
 
-//     if (verbose)
-//         printf("--- Heap Check Passed ---\n");
-//     return 1;
-// }
+    if (verbose)
+        printf("--- Heap Check Passed ---\n");
+    return 1;
+}
