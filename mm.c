@@ -46,9 +46,10 @@ team_t team = {
 #define DSIZE 8                  // 定义双字大小为8字节
 #define PTRSIZE (sizeof(void *)) // 指针大小
 #define INIT_CHUNK (1 << 10)     // 1KB 初始扩堆
-#define SMALL_EXT (1 << 10)      // 1KB
-#define MID_EXT (1 << 11)        // 2KB
-#define LARGE_EXT (1 << 12)      // 4KB
+#define SMALL_EXT (1 << 9)       // 512B
+#define MID_EXT (1 << 10)        // 1KB
+#define LARGE_EXT (1 << 11)      // 2KB
+#define FRONT_CUT_SIZE 96        // 前端切分大小96字节
 
 #define MIN_BLOCK_SIZE (ALIGN(2 * WSIZE + 2 * PTRSIZE)) // 最小块大小
 #define LIST_MAX 64                                     // 分离空闲链表的条数
@@ -111,7 +112,7 @@ static void *coalesce(void *bp);
 // 在分离空闲链表中寻找空闲块
 static void *find_fit(size_t asize);
 // 在空闲块中放置已分配块
-static void place(void *bp, size_t asize);
+static void *place(void *bp, size_t asize);
 
 /*
  * mm_init - initialize the malloc package.
@@ -191,8 +192,7 @@ void *mm_malloc(size_t size)
     void *bp = find_fit(asize);
     if (bp != NULL)
     {
-        place(bp, asize);
-        return bp;
+        return place(bp, asize);
     }
 
     // 若找不到合适的空闲块,则需要扩展堆
@@ -217,8 +217,7 @@ void *mm_malloc(size_t size)
     }
 
     // 在新扩展的空闲块中放置 asize 大小的已分配块
-    place(bp, asize);
-    return bp;
+    return place(bp, asize);
 }
 
 /*
@@ -702,7 +701,7 @@ static void *find_fit(size_t asize)
  *   否则:
  *       - 整块都标记为已分配
  */
-static void place(void *bp, size_t asize)
+static void *place(void *bp, size_t asize)
 {
     size_t csize = GET_SIZE(HDRP(bp)); // 获得当前空闲块的总大小
     size_t remain = csize - asize;     // 剩下的空间
@@ -716,25 +715,48 @@ static void place(void *bp, size_t asize)
     {
         // 可以分割
         // 前半部分: 已分配块
-        PUT(HDRP(bp), PACK_HDR(asize, 1, prev_alloc));
+        if (asize <= FRONT_CUT_SIZE)
+        {
+            PUT(HDRP(bp), PACK_HDR(asize, 1, prev_alloc));
 
-        // 找到剩余部分的指针
-        void *next = NEXT_BLKP(bp);
+            // 找到剩余部分的指针
+            void *next = NEXT_BLKP(bp);
 
-        // 后半部分: 新空闲块
-        PUT(HDRP(next), PACK_HDR(remain, 0, 1));
-        PUT(FTRP_FREE(next), PACK_FTR(remain));
+            // 后半部分: 新空闲块
+            PUT(HDRP(next), PACK_HDR(remain, 0, 1));
+            PUT(FTRP_FREE(next), PACK_FTR(remain));
 
-        coalesce(next); // 与可能的后继空闲块合并
+            coalesce(next); // 与可能的后继空闲块合并
+            return bp;
+        }
+        else
+        {
+            // 1. 前半部分变成新的空闲块
+            PUT(HDRP(bp), PACK_HDR(remain, 0, prev_alloc));
+            PUT(FTRP_FREE(bp), PACK_FTR(remain));
+
+            // 2. 后半部分变成已分配块
+            void *new_bp = NEXT_BLKP(bp);
+            // 注意：因为前面变成了空闲块，所以这里的 prev_alloc 是 0
+            PUT(HDRP(new_bp), PACK_HDR(asize, 1, 0));
+
+            // 3. 别忘了更新它的下一个块的 prev_alloc 位
+            SET_NEXT_PREV_ALLOC(new_bp);
+
+            // 4. 把前半部分的空闲块加入链表 (coalesce 会处理前驱合并)
+            coalesce(bp);
+
+            // 返回后半部分的指针
+            return new_bp;
+        }
     }
-    else
-    {
-        // 剩余空间不足以形成一个最小块,整块直接分配
-        PUT(HDRP(bp), PACK_HDR(csize, 1, prev_alloc));
 
-        // 后继块看到前块是已分配块
-        SET_NEXT_PREV_ALLOC(bp);
-    }
+    // 剩余空间不足以形成一个最小块,整块直接分配
+    PUT(HDRP(bp), PACK_HDR(csize, 1, prev_alloc));
+
+    // 后继块看到前块是已分配块
+    SET_NEXT_PREV_ALLOC(bp);
+    return bp;
 }
 
 /*
